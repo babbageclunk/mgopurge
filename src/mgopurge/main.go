@@ -13,10 +13,11 @@ import (
 	"net"
 	"os"
 	"strings"
-	"time"
+	// "time"
 
-	jujutxn "github.com/juju/txn"
+	// jujutxn "github.com/juju/txn"
 	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 	"gopkg.in/mgo.v2/txn"
 )
 
@@ -41,69 +42,73 @@ Ok to proceed?`[1:]
 // allStages defines all of mgopurge's stages. As some stages must be
 // run before others, the ordering is important.
 var allStages = []stage{
+	// {
+	// 	"presence",
+	// 	"Clear presence data. This will be recreated when the controllers restart.",
+	// 	func(db *mgo.Database, _ *mgo.Collection) error {
+	// 		presenceDB := db.Session.DB("presence")
+	// 		err := presenceDB.DropDatabase()
+	// 		return err
+	// 	},
+	// }, {
+	// 	"purgemissing",
+	// 	"Purge orphaned transactions",
+	// 	func(db *mgo.Database, txns *mgo.Collection) error {
+	// 		collections := getAllPurgeableCollections(db)
+	// 		return PurgeMissing(txns, db.C(txnsStashC), collections...)
+	// 	},
+	// }, {
+	// 	"trim",
+	// 	"Trim txn-queues that are longer than 1000",
+	// 	func(db *mgo.Database, txns *mgo.Collection) error {
+	// 		collections := getAllPurgeableCollections(db)
+	// 		trimmer := &LongTxnTrimmer{
+	// 			timer:        newSimpleTimer(15 * time.Second),
+	// 			txns:         txns,
+	// 			longTxnSize:  1000,
+	// 			txnBatchSize: txnBatchSize,
+	// 		}
+	// 		return trimmer.Trim(collections)
+	// 	},
+	// }, {
+	// 	"resume",
+	// 	"Resume incomplete transactions",
+	// 	func(db *mgo.Database, txns *mgo.Collection) error {
+	// 		return ResumeAll(txns)
+	// 	},
+	// }, {
+	// 	"prune",
+	// 	"Prune finalised transactions",
+	// 	func(db *mgo.Database, txns *mgo.Collection) error {
+	// 		stats, err := jujutxn.CleanAndPrune(jujutxn.CleanAndPruneArgs{
+	// 			Txns:    txns,
+	// 			MaxTime: time.Now().Add(-time.Hour),
+	// 		})
+	// 		logger.Infof("clean and prune cleaned %d docs in %d collections\n"+
+	// 			"  removed %d transactions and %d stash documents",
+	// 			stats.DocsCleaned, stats.CollectionsInspected,
+	// 			stats.TransactionsRemoved, stats.StashDocumentsRemoved)
+	// 		return err
+	// 	},
+	// }, {
+	// 	"compact",
+	// 	"Compact database to release disk space (does not compact replicas)",
+	// 	func(db *mgo.Database, _ *mgo.Collection) error {
+	// 		err := compact(db)
+	// 		if err != nil {
+	// 			return err
+	// 		}
+	// 		logsDB := db.Session.DB("logs")
+	// 		err = compact(logsDB)
+	// 		if err != nil {
+	// 			return err
+	// 		}
+	// 		return nil
+	// 	},
 	{
-		"presence",
-		"Clear presence data. This will be recreated when the controllers restart.",
-		func(db *mgo.Database, _ *mgo.Collection) error {
-			presenceDB := db.Session.DB("presence")
-			err := presenceDB.DropDatabase()
-			return err
-		},
-	}, {
-		"purgemissing",
-		"Purge orphaned transactions",
-		func(db *mgo.Database, txns *mgo.Collection) error {
-			collections := getAllPurgeableCollections(db)
-			return PurgeMissing(txns, db.C(txnsStashC), collections...)
-		},
-	}, {
-		"trim",
-		"Trim txn-queues that are longer than 1000",
-		func(db *mgo.Database, txns *mgo.Collection) error {
-			collections := getAllPurgeableCollections(db)
-			trimmer := &LongTxnTrimmer{
-				timer:        newSimpleTimer(15 * time.Second),
-				txns:         txns,
-				longTxnSize:  1000,
-				txnBatchSize: txnBatchSize,
-			}
-			return trimmer.Trim(collections)
-		},
-	}, {
-		"resume",
-		"Resume incomplete transactions",
-		func(db *mgo.Database, txns *mgo.Collection) error {
-			return ResumeAll(txns)
-		},
-	}, {
-		"prune",
-		"Prune finalised transactions",
-		func(db *mgo.Database, txns *mgo.Collection) error {
-			stats, err := jujutxn.CleanAndPrune(jujutxn.CleanAndPruneArgs{
-				Txns:    txns,
-				MaxTime: time.Now().Add(-time.Hour),
-			})
-			logger.Infof("clean and prune cleaned %d docs in %d collections\n"+
-				"  removed %d transactions and %d stash documents",
-				stats.DocsCleaned, stats.CollectionsInspected,
-				stats.TransactionsRemoved, stats.StashDocumentsRemoved)
-			return err
-		},
-	}, {
-		"compact",
-		"Compact database to release disk space (does not compact replicas)",
-		func(db *mgo.Database, _ *mgo.Collection) error {
-			err := compact(db)
-			if err != nil {
-				return err
-			}
-			logsDB := db.Session.DB("logs")
-			err = compact(logsDB)
-			if err != nil {
-				return err
-			}
-			return nil
-		},
+		"find-weird",
+		"Find the transactions that are missing from their corresponding stash records",
+		findWeird,
 	},
 }
 
@@ -312,4 +317,99 @@ func getAllPurgeableCollections(db *mgo.Database) (collections []string) {
 func ResumeAll(tc *mgo.Collection) error {
 	runner := txn.NewRunner(tc)
 	return runner.ResumeAll()
+}
+
+type transaction struct {
+	Id     bson.ObjectId `bson:"_id"`
+	State  int           `bson:"s"`
+	Info   interface{}   `bson:"i,omitempty"`
+	Ops    []txn.Op      `bson:"o"`
+	Nonce  string        `bson:"n,omitempty"`
+	Revnos []int64       `bson:"r,omitempty"`
+}
+
+type badOp struct {
+	txnId bson.ObjectId
+	nonce string
+	c     string
+	id    interface{}
+}
+
+func findWeird(db *mgo.Database, txns *mgo.Collection) error {
+	stashes, err := loadStashes(db.C(txnsStashC))
+	if err != nil {
+		return err
+	}
+	logger.Debugf("%d stashes loaded", len(stashes))
+	iter := txns.Find(bson.M{"s": tprepared}).Iter()
+	var (
+		row   transaction
+		weird []badOp
+	)
+	for iter.Next(&row) {
+		txnId := fmt.Sprintf("%s_%s", row.Id.Hex(), row.Nonce)
+		for _, op := range row.Ops {
+			if op.Insert == nil {
+				continue
+			}
+			if !checkStash(stashes, txnId, op) {
+				weird = append(weird, badOp{
+					row.Id,
+					row.Nonce,
+					op.C,
+					op.Id,
+				})
+			}
+		}
+	}
+
+	if len(weird) > 0 {
+		fmt.Println("c,id,txn,nonce")
+		for _, w := range weird {
+			fmt.Printf("%s,%s,%s,%s\n", w.c, w.id, w.txnId.Hex(), w.nonce)
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+var txnInfoFields = bson.D{{"txn-queue", 1}, {"txn-revno", 1}, {"txn-remove", 1}, {"txn-insert", 1}}
+
+type stashRow struct {
+	Key    docKey        `bson:"_id"`
+	Queue  []string      `bson:"txn-queue"`
+	Revno  int64         `bson:"txn-revno,omitempty"`
+	Insert bson.ObjectId `bson:"txn-insert,omitempty"`
+	Remove bson.ObjectId `bson:"txn-remove,omitempty"`
+}
+
+func loadStashes(stashesC *mgo.Collection) (map[docKey]*stashRow, error) {
+	stashes := make(map[docKey]*stashRow)
+	iter := stashesC.Find(nil).Iter()
+	var row stashRow
+	for iter.Next(&row) {
+		// Copy so all entries aren't the same last value.
+		local := row
+		stashes[local.Key] = &local
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return stashes, nil
+}
+
+func checkStash(stashes map[docKey]*stashRow, txnId string, op txn.Op) bool {
+	key := docKey{C: op.C, Id: op.Id}
+	info, found := stashes[key]
+	if !found {
+		return true
+	}
+	for _, txnKey := range info.Queue {
+		if txnId == txnKey {
+			return true
+		}
+	}
+	return false
 }
